@@ -1,0 +1,174 @@
+diff --git a/APP/User_App/inc/App_VideoRx_Handle.h b/APP/User_App/inc/App_VideoRx_Handle.h
+index 289397e..9e8012f 100644
+--- a/APP/User_App/inc/App_VideoRx_Handle.h
++++ b/APP/User_App/inc/App_VideoRx_Handle.h
+@@ -6,19 +6,29 @@
+ /**
+  * @name    VideoRxStats_t
+  * @brief   Counters for the received video stream.
+- * @note    All three are exact, cumulative for the life of the board, and are
++ * @note    All five are exact, cumulative for the life of the board, and are
+  *          the numbers to read when the stream misbehaves at the consumer end.
+  *          ReadBytes is what the consumer has taken; TotalBytes is what
+  *          arrived; the two differ by whatever is still sitting in the buffer.
+  *          A DroppedBytes that keeps growing means the consumer is not calling
+  *          App_VideoRxRead often enough - it is not a link problem and no
+  *          amount of radio tuning will fix it.
++ *
++ *          LostFrames and BadCrcFrames are the other two ways a stream goes
++ *          wrong and neither is the consumer's doing: a frame counted in
++ *          LostFrames never arrived at all, a frame counted in BadCrcFrames
++ *          arrived damaged and was refused. Both leave the same kind of hole
++ *          in the bytes handed over, and one hole costs as much picture as
++ *          the encoder's key frame interval - read these two before blaming
++ *          the decoder for what it was fed.
+  */
+ typedef struct
+ {
+     uint32_t TotalBytes;    /**< payload bytes received and made readable */
+     uint32_t ReadBytes;     /**< payload bytes the consumer has taken away */
+     uint32_t DroppedBytes;  /**< bytes lost because the buffer was full     */
++    uint32_t LostFrames;    /**< numbered frames that never turned up      */
++    uint32_t BadCrcFrames;  /**< frames refused, their CRC did not match   */
+ } VideoRxStats_t;
+ 
+ /**
+diff --git a/APP/User_App/src/App_R900PNR_Handle.c b/APP/User_App/src/App_R900PNR_Handle.c
+index 836c02b..1e4454c 100644
+--- a/APP/User_App/src/App_R900PNR_Handle.c
++++ b/APP/User_App/src/App_R900PNR_Handle.c
+@@ -64,6 +64,8 @@ static uint32_t Rx_Last_Seq    = 0u;
+ 
+ static uint32_t Rx_Vid_Total   = 0u;
+ static uint32_t Rx_Lost_Total  = 0u;
++static uint32_t Rx_Seq_Max     = 0u;   /* highest seq the sender stamped     */
++static uint32_t Rx_Bad_Total   = 0u;   /* CRC failures, cumulative           */
+ 
+ static uint32_t Rx_Stall_Cnt   = 0u;
+ 
+@@ -334,6 +336,11 @@ static void App_RxCountLoss(const uint8_t *data, uint32_t len)
+         Rx_Lost_Total += (seq - Rx_Last_Seq - 1u);
+     }
+ 
++    if (seq > Rx_Seq_Max)
++    {
++        Rx_Seq_Max = seq;
++    }
++
+     Rx_Last_Seq  = seq;
+     Rx_Have_Last = 1u;
+ }
+@@ -377,26 +384,30 @@ static void App_RxTraceFrame(const uint8_t *data, uint32_t len,
+  * @brief   Verify the CRC32 a received frame carries over its payload.
+  * @param   data: received frame, at least VID_FRAME_HDR_LEN bytes.
+  * @param   len: frame length in bytes.
+- * @retval  None
++ * @retval  1 when the payload is intact, 0 when it must not be forwarded.
+  * @note    A frame too short to hold a whole payload is counted apart from a
+  *          real mismatch: nothing was checked, so calling it bad would blame
+- *          the wire for a length problem.
++ *          the wire for a length problem. Either way the caller has to refuse
++ *          the payload - a decoder handed bytes already known to be wrong
++ *          turns one damaged frame into a stream it cannot tell from a good
++ *          one, which is worse than the hole left by dropping it.
+  */
+-static void App_RxCheckCrc(const uint8_t *data, uint32_t len)
++static uint8_t App_RxCheckCrc(const uint8_t *data, uint32_t len)
+ {
+     uint32_t magic;
+     uint32_t crc_field;
+     uint32_t crc_calc;
++    uint8_t  pass = 1u;
+ 
+     if (len < VID_FRAME_HDR_LEN)
+     {
+-        return;
++        return 0u;
+     }
+ 
+     magic = (uint32_t)data[0] | ((uint32_t)data[1] << 8);
+     if (magic != VID_FRAME_MAGIC)
+     {
+-        return;
++        return 0u;
+     }
+ 
+     crc_field = (uint32_t)data[8]
+@@ -407,22 +418,25 @@ static void App_RxCheckCrc(const uint8_t *data, uint32_t len)
+     if (len < VID_FRAME_LEN)
+     {
+         Rx_Short_Frames++;
+-#if (VID_RX_TRACE != 0u)
+-        App_RxTraceFrame(data, len, crc_field);
+-#endif
+-        return;
++        pass = 0u;
+     }
+-
+-    crc_calc = App_Crc32(&data[VID_FRAME_HDR_LEN],
+-                                   VID_FRAME_PAYLOAD_LEN);
+-    if (crc_calc != crc_field)
++    else
+     {
+-        Rx_Bad_Crc++;
++        crc_calc = App_Crc32(&data[VID_FRAME_HDR_LEN],
++                                       VID_FRAME_PAYLOAD_LEN);
++        if (crc_calc != crc_field)
++        {
++            Rx_Bad_Crc++;
++            Rx_Bad_Total++;
++            pass = 0u;
++        }
+     }
+ 
+ #if (VID_RX_TRACE != 0u)
+     App_RxTraceFrame(data, len, crc_field);
+ #endif
++
++    return pass;
+ }
+ 
+ /**
+@@ -531,14 +545,29 @@ uint32_t App_VideoRxRead(uint8_t *pBuf, uint32_t MaxLen)
+  */
+ void App_VideoRxGetStats(VideoRxStats_t *pStats)
+ {
++    uint32_t lost;
++
+     if (pStats == NULL)
+     {
+         return;
+     }
+ 
++    /* Frames the sender stamped but that never turned up: the highest seq
++     * seen, plus one for the frame numbered zero, less the frames that did
++     * arrive. Counting arrivals against the numbering is the reliable way -
++     * summing the gaps between consecutive seq values counts reordering and
++     * duplicate delivery as loss and overstates it by up to sixteen times. */
++    lost = 0u;
++    if ((Rx_Vid_Total != 0u) && (Rx_Seq_Max >= (Rx_Vid_Total - 1u)))
++    {
++        lost = (Rx_Seq_Max + 1u) - Rx_Vid_Total;
++    }
++
+     pStats->TotalBytes   = Rx_Ring_Written;
+     pStats->ReadBytes    = Rx_Ring_Read;
+     pStats->DroppedBytes = Rx_Ring_Dropped;
++    pStats->LostFrames   = lost;
++    pStats->BadCrcFrames = Rx_Bad_Total;
+ }
+ #endif
+ 
+@@ -584,8 +613,10 @@ void App_RxDataHandler(uint8_t *data, uint32_t len)
+     }
+ 
+     App_RxCountLoss(vid_data, vid_len);
+-    App_RxCheckCrc(vid_data, vid_len);
+-    App_RingWrite(&vid_data[VID_FRAME_HDR_LEN], VID_FRAME_PAYLOAD_LEN);
++    if (App_RxCheckCrc(vid_data, vid_len) != 0u)
++    {
++        App_RingWrite(&vid_data[VID_FRAME_HDR_LEN], VID_FRAME_PAYLOAD_LEN);
++    }
+ #endif
+ }
+ 

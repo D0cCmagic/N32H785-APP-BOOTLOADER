@@ -1,0 +1,56 @@
+# ===== Keil MDK build outputs =====
+Objects/
+Listings/
+DebugConfig/
+EventRecorderStub.scvd
+*.uvguix.*
+*.bak
+*.dep
+*.d
+*.crf
+*.o
+*.axf
+*.htm
+*.lnp
+*.iex
+*.lst
+*.map
+
+# ===== generated binaries =====
+*.bin
+*.hex
+*.elf
+
+# ===== video payloads and extracted clips =====
+# 测试素材，十几 MB 一个，不进仓库
+*.h265
+*.hevc
+*.mp4
+*.h264
+
+# ===== python tooling =====
+__pycache__/
+
+# ===== JLink =====
+JLinkLog*
+
+# ===== DSH 临时脚本与备份（不进仓库）=====
+tmp_pdf/
+*.bak_cleanup
+*.bak_uart
+
+# ===== EtherCAT / ESC 预研代码（不在 Keil 工程里，未参与编译）=====
+# 这些文件当前不被任何 target 引用（.uvprojx 中零引用）。
+# 将来启用 EtherCAT 从站时，删掉这组忽略即可。
+APP/Mcal/inc/Mcal_Esc_Init.h
+APP/Mcal/inc/Mcal_Esc_Reg.h
+APP/Mcal/src/Mcal_Esc_Init.c
+APP/Mcal/src/Mcal_Esc_Reg.c
+APP/User_App/inc/App_Cia402.h
+APP/User_App/inc/App_Esc_Esm.h
+APP/User_App/inc/App_Esc_Reg.h
+APP/User_App/src/App_Cia402.c
+APP/User_App/src/App_Esc_Esm.c
+# ===== EtherCAT / CiA402 预研脚本（未参与构建）=====
+APP/tools/cia402_behaviour_check.c
+APP/tools/cia402_table_check.py
